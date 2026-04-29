@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+node_modules/
+.DS_Store
+eval-out/
+pipeline-out/
+pipeline/pipelined
+*.mp4
+!eval/fixtures/*.mp4
