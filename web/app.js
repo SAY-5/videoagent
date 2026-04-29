@@ -31,28 +31,79 @@ function svg(tag, attrs = {}, ...children) {
 async function submit() {
   if (!state.instruction.trim() || state.busy) return;
   state.busy = true;
-  state.job = null;
+  // v2: streaming planner trace. Events fill in the job as they arrive.
+  state.job = {
+    id: "live", status: "planning",
+    plan: { ops: [] }, error: "", raw_calls: [], trace: [],
+  };
   render();
   try {
-    const r = await fetch("/v1/jobs", {
+    const r = await fetch("/v1/plan/stream", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
       body: JSON.stringify({
         source_url: "demo://source.mp4",
         instruction: state.instruction,
         duration_s: state.duration,
       }),
     });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    const { job_id } = await r.json();
-    const detail = await (await fetch(`/v1/jobs/${job_id}`)).json();
-    state.job = detail;
+    if (!r.ok || !r.body) throw new Error(`HTTP ${r.status}`);
+    const reader = r.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf("\n\n")) !== -1) {
+        applyFrame(buf.slice(0, idx));
+        buf = buf.slice(idx + 2);
+      }
+    }
   } catch (err) {
-    state.job = { status: "failed", error: err.message };
+    state.job = { ...state.job, status: "failed", error: err.message };
   } finally {
     state.busy = false;
     render();
   }
+}
+
+function applyFrame(frame) {
+  let event = "message"; let data = "";
+  for (const line of frame.split("\n")) {
+    if (line.startsWith("event:")) event = line.slice(6).trim();
+    else if (line.startsWith("data:")) data = line.slice(5).trim();
+  }
+  if (!data) return;
+  let d; try { d = JSON.parse(data); } catch { return; }
+  state.job.trace.push({ event, ...d });
+  switch (event) {
+    case "job":
+      state.job.id = d.job_id;
+      break;
+    case "tool_calls":
+      state.job.plan.ops = (d.calls || []).map((c) => {
+        try { return { op: c.name, ...JSON.parse(c.args) }; }
+        catch { return { op: c.name, _raw: c.args }; }
+      });
+      break;
+    case "verify_fail":
+      state.job.status = "verify_fail";
+      state.job.error = (d.errors || []).map((e) => `${e.code}: ${e.hint}`).join(" | ");
+      break;
+    case "plan_ready":
+      state.job.status = "ready";
+      state.job.plan.ops = d.ops || [];
+      state.job.error = "";
+      break;
+    case "plan_failed":
+      state.job.status = "failed";
+      state.job.error = (d.errors || []).map((e) => `${e.code}: ${e.hint}`).join(" | ");
+      break;
+    default: break;
+  }
+  render();
 }
 
 function render() {

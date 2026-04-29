@@ -86,19 +86,47 @@ def plan(
     instruction: str,
     source: SourceProbe,
     config: PlannerConfig | None = None,
+    on_event: "Callable[[dict[str, Any]], None] | None" = None,
 ) -> PlanResult:
+    """Plan a sequence of FFmpeg ops.
+
+    on_event (v2) is called with structured events as the planner
+    progresses: probe → llm_call → tool_calls → verify_ok|verify_fail
+    → replan? → plan_ready|plan_failed. The HTTP layer translates each
+    event into an SSE frame so the UI fills in the trace live."""
     cfg = config or PlannerConfig()
     messages: list[dict[str, Any]] = _initial_messages(instruction, source)
     raw_calls: list[dict[str, Any]] = []
     schemas = tool_schemas()
     last_errors: list[VerifyError] = []
+    if on_event is not None:
+        on_event({
+            "type": "probe",
+            "duration_s": source.duration_s,
+            "width": source.width,
+            "height": source.height,
+            "fps": source.fps,
+            "has_audio": source.has_audio,
+        })
 
     for replans in range(cfg.max_replans + 1):
+        if on_event is not None:
+            on_event({"type": "llm_call", "attempt": replans})
         resp = chat.complete(messages=messages, tools=schemas)
         choice = resp["choices"][0]
         msg = choice.get("message", {})
         tool_calls = msg.get("tool_calls") or []
         raw_calls.extend(tool_calls)
+        if on_event is not None:
+            on_event({
+                "type": "tool_calls",
+                "attempt": replans,
+                "calls": [
+                    {"name": (tc.get("function") or {}).get("name", ""),
+                     "args": (tc.get("function") or {}).get("arguments", "{}")}
+                    for tc in tool_calls
+                ],
+            })
 
         try:
             p = _parse_plan(tool_calls, max_ops=cfg.max_ops)
@@ -117,11 +145,34 @@ def plan(
 
         last_errors = verify(p, source)
         if not last_errors:
+            if on_event is not None:
+                on_event({
+                    "type": "plan_ready",
+                    "attempt": replans,
+                    "ops": [op.model_dump() for op in p.ops],
+                })
             return PlanResult(plan=p, errors=[], raw_calls=raw_calls, replans=replans)
 
         # Verification failed — feed the structured errors back and try once more.
+        if on_event is not None:
+            on_event({
+                "type": "verify_fail",
+                "attempt": replans,
+                "errors": [
+                    {"op_idx": e.op_idx, "code": e.code, "hint": e.hint}
+                    for e in last_errors
+                ],
+            })
         messages = _replan_messages(instruction, source, last_errors)
 
+    if on_event is not None:
+        on_event({
+            "type": "plan_failed",
+            "errors": [
+                {"op_idx": e.op_idx, "code": e.code, "hint": e.hint}
+                for e in last_errors
+            ],
+        })
     return PlanResult(plan=None, errors=last_errors, raw_calls=raw_calls, replans=cfg.max_replans)
 
 

@@ -84,8 +84,8 @@ def build_app(
 
     @app.get("/v1/jobs/{job_id}/stream")
     def stream(job_id: str) -> StreamingResponse:
-        """SSE: emits the job's terminal status. v2 streams real-time
-        planner + ffmpeg progress; v1 sends one frame and ends."""
+        """SSE: terminal-status frame for an already-submitted job.
+        Live planner trace lives at POST /v1/plan/stream below."""
         def gen() -> Iterator[bytes]:
             with state["lock"]:
                 j = state["jobs"].get(job_id)
@@ -96,6 +96,76 @@ def build_app(
             yield ("event: " + j.status + "\ndata: "
                    + _json.dumps(_job_to_dict(j)) + "\n\n").encode()
             yield b"event: end\ndata: {}\n\n"
+        return StreamingResponse(
+            gen(), media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.post("/v1/plan/stream")
+    def plan_stream(body: SubmitBody) -> StreamingResponse:
+        """v2: stream planner events as SSE while the LLM call + verify
+        loop runs. Frames in arrival order:
+            job → probe → llm_call → tool_calls → verify_fail?
+            → plan_ready | plan_failed → end
+        The UI renders the trace as decisions land. The job is also
+        registered in state['jobs'] so GET /v1/jobs/{id} keeps working
+        for the same id."""
+        from .planner import plan as run_plan
+        job = Job(id="j_" + uuid.uuid4().hex[:12], submit=body.model_dump())
+        with state["lock"]:
+            state["jobs"][job.id] = job
+
+        def gen() -> Iterator[bytes]:
+            import json as _json
+            queue: list[dict[str, Any]] = []
+            cv = threading.Condition()
+            done = threading.Event()
+
+            def on_event(ev: dict[str, Any]) -> None:
+                with cv:
+                    queue.append(ev)
+                    cv.notify()
+
+            src = SourceProbe(
+                duration_s=body.duration_s,
+                width=body.width,
+                height=body.height,
+                fps=body.fps,
+                has_audio=body.has_audio,
+            )
+
+            def runner() -> None:
+                try:
+                    res = run_plan(
+                        state["chat"], body.instruction, src,
+                        state["config"], on_event=on_event,
+                    )
+                    if res.plan is not None:
+                        job.status = "ready"
+                        job.plan = res.plan.model_dump()
+                    else:
+                        job.status = "failed"
+                        job.error = "; ".join(f"{e.code}: {e.hint}" for e in res.errors)
+                    job.raw_calls = res.raw_calls
+                finally:
+                    done.set()
+                    with cv:
+                        cv.notify()
+
+            threading.Thread(target=runner, daemon=True).start()
+            yield (f"event: job\ndata: {_json.dumps({'job_id': job.id})}\n\n").encode()
+            while True:
+                with cv:
+                    while not queue and not done.is_set():
+                        cv.wait()
+                    drained = queue[:]
+                    del queue[:]
+                for ev in drained:
+                    yield (f"event: {ev['type']}\ndata: {_json.dumps(ev, default=str)}\n\n").encode()
+                if done.is_set() and not queue:
+                    break
+            yield b"event: end\ndata: {}\n\n"
+
         return StreamingResponse(
             gen(), media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
