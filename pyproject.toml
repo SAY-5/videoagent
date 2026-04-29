@@ -23,6 +23,10 @@ include = ["videoagent*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+# `eval/` is a top-level package alongside `videoagent/` (it's the v3
+# eval suite, not part of the importable wheel). Put the project root
+# on the import path so `from eval.cases import ...` resolves.
+pythonpath = ["."]
 
 [tool.ruff]
 line-length = 100
