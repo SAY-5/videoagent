@@ -15,8 +15,17 @@ jobs:
           python-version: "3.12"
           cache: "pip"
       - run: pip install -e ".[dev]"
-      - run: ruff check videoagent tests
+      - run: ruff check videoagent tests eval
       - run: pytest -q
+      - name: v3 eval suite (regression gate)
+        run: python -m eval.runner --json eval-out/report.json
+      - name: upload eval report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: videoagent-eval
+          path: eval-out/
+          if-no-files-found: ignore
 
   go:
     runs-on: ubuntu-latest

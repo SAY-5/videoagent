@@ -86,7 +86,7 @@ def plan(
     instruction: str,
     source: SourceProbe,
     config: PlannerConfig | None = None,
-    on_event: "Callable[[dict[str, Any]], None] | None" = None,
+    on_event: Callable[[dict[str, Any]], None] | None = None,
 ) -> PlanResult:
     """Plan a sequence of FFmpeg ops.
 
